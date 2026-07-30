@@ -2,9 +2,9 @@
   "name": "drcv-backend",
   "version": "1.0.0",
   "type": "module",
-  "main": "serverr.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node serverr.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
