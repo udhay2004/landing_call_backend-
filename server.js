@@ -10,33 +10,35 @@
  *                           "connect me with Dr. CV now?". On "no", emails
  *                           a resumable link to the address they gave.
  *   4. POST /transcript  → appends live call turns and, at the end of the
- *                           call, the final score. Flags hot leads for a
- *                           human to follow up with, and emails an alert.
+ *                           call, generates a structured summary (key points,
+ *                           concerns, services discussed, next steps) via
+ *                           Claude so every completed call is CRM-ready —
+ *                           no scoring/threshold, every lead shows up.
  *   5. GET  /             → health-check / keep-alive.
  *
  * ENV VARS required:
- *   OPENAI_API_KEY   — your OpenAI secret key (NOT Anthropic)
- *   MONGODB_URI      — connection string for lead/transcript storage
+ *   OPENAI_API_KEY    — your OpenAI secret key (NOT Anthropic), for the Realtime session
+ *   MONGODB_URI       — connection string for lead/transcript storage
+ *   ANTHROPIC_API_KEY — used to generate the structured conversation summary
  *
  * Optional:
  *   PORT               — defaults to 3000
  *   MONGODB_DB         — defaults to "drcv"
  *   FRONTEND_ORIGIN    — your landing page's origin, locks down CORS (defaults to "*")
  *   FRONTEND_URL       — your landing page's base URL, used to build the resume link
- *   SMTP_HOST/PORT/SECURE/USER/PASS — outgoing mail for the resume link + hot-lead alerts
+ *   SMTP_HOST/PORT/SECURE/USER/PASS — outgoing mail for the resume link + new-lead alerts
  *   MAIL_FROM          — "from" address for both emails (defaults to SMTP_USER)
- *   ADMIN_NOTIFY_EMAIL — where hot-lead alerts get sent (skipped if unset)
- *   SCORE_MIN          — score threshold for human handoff (defaults to 55, matches call.html)
+ *   ADMIN_NOTIFY_EMAIL — where new-lead alerts get sent once a call completes (skipped if unset)
  */
 
 import express from 'express';
 import cors    from 'cors';
 import { getDb, leadsCollection } from './db.js';
-import { sendResumeEmail, sendHotLeadAlert } from './mailer.js';
+import { sendResumeEmail, sendNewLeadAlert } from './mailer.js';
+import { summarizeConversation } from './summarize.js';
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
-const SCORE_MIN = Number(process.env.SCORE_MIN || 55);
 
 function newId(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
@@ -153,9 +155,8 @@ app.post('/lead', async (req, res) => {
     createdAt: new Date(),
     updatedAt: new Date(),
     transcript: [],
-    score: null,
-    humanHandoff: false,
-    hotAlertSent: false,
+    summary: null,
+    completedAt: null,
   };
 
   try {
@@ -208,13 +209,15 @@ app.post('/consent', async (req, res) => {
  * Called repeatedly during a call, and once more at the end.
  *
  * Mid-call body:  { leadId, sessionId, turn: { role, text, n, ts } }
- * End-of-call:    { leadId, sessionId, complete: true, duration, turnCount, score }
+ * End-of-call:    { leadId, sessionId, complete: true, duration, turnCount }
  *
- * At completion, flags the lead for human handoff if score.total >= SCORE_MIN
- * and sends one hot-lead alert email (guarded so it only fires once).
+ * At completion, generates a structured summary from the full stored
+ * transcript (key points, concerns, services discussed, next steps) via
+ * Claude, and emails a new-lead alert. No scoring/threshold — every
+ * completed call becomes a reviewable lead in the CRM.
  */
 app.post('/transcript', async (req, res) => {
-  const { leadId, sessionId, turn, complete, duration, turnCount, score } = req.body || {};
+  const { leadId, sessionId, turn, complete, duration, turnCount } = req.body || {};
   if (!leadId || !sessionId) {
     return res.status(400).json({ error: 'leadId and sessionId are required' });
   }
@@ -233,19 +236,20 @@ app.post('/transcript', async (req, res) => {
     }
 
     if (complete) {
-      const humanHandoff = !!(score && score.total >= SCORE_MIN);
+      const existing = await col.findOne({ leadId, sessionId });
+      const summary = await summarizeConversation(existing?.transcript || []);
+
       const result = await col.findOneAndUpdate(
         { leadId, sessionId },
-        { $set: { duration, turnCount, score, humanHandoff, updatedAt: new Date() } },
+        { $set: { duration, turnCount, summary, completedAt: new Date(), updatedAt: new Date() } },
         { returnDocument: 'after' }
       );
       const lead = result.value || result;
 
-      if (humanHandoff && lead && !lead.hotAlertSent) {
-        sendHotLeadAlert(lead).catch(err => console.error('Hot lead alert failed:', err.message));
-        await col.updateOne({ leadId, sessionId }, { $set: { hotAlertSent: true } });
+      if (lead) {
+        sendNewLeadAlert(lead).catch(err => console.error('New lead alert failed:', err.message));
       }
-      return res.json({ ok: true, humanHandoff });
+      return res.json({ ok: true });
     }
 
     return res.status(400).json({ error: 'Provide either turn or complete' });
