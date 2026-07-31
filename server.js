@@ -1,27 +1,53 @@
 /**
  * Comply Globally — Dr. CV Voice Backend
  * ─────────────────────────────────────────────────────
- * Serves two purposes:
- *   1. POST /session → mints an OpenAI Realtime ephemeral token
- *      and returns it to the browser so WebRTC can connect directly
- *      to OpenAI (browser ↔ OpenAI, audio never touches this server).
- *   2. GET /         → health-check / keep-alive for Render.
+ * Serves:
+ *   1. POST /session     → mints an OpenAI Realtime ephemeral token.
+ *   2. POST /lead        → creates a lead record (source of truth for
+ *                           leadId/sessionId), called right after the
+ *                           landing page form is submitted.
+ *   3. POST /consent     → records the visitor's yes/no answer to
+ *                           "connect me with Dr. CV now?". On "no", emails
+ *                           a resumable link to the address they gave.
+ *   4. POST /transcript  → appends live call turns and, at the end of the
+ *                           call, the final score. Flags hot leads for a
+ *                           human to follow up with, and emails an alert.
+ *   5. GET  /             → health-check / keep-alive.
  *
- * ENV VARS required on Render:
+ * ENV VARS required:
  *   OPENAI_API_KEY   — your OpenAI secret key (NOT Anthropic)
+ *   MONGODB_URI      — connection string for lead/transcript storage
  *
  * Optional:
- *   PORT             — defaults to 3000
+ *   PORT               — defaults to 3000
+ *   MONGODB_DB         — defaults to "drcv"
+ *   FRONTEND_ORIGIN    — your landing page's origin, locks down CORS (defaults to "*")
+ *   FRONTEND_URL       — your landing page's base URL, used to build the resume link
+ *   SMTP_HOST/PORT/SECURE/USER/PASS — outgoing mail for the resume link + hot-lead alerts
+ *   MAIL_FROM          — "from" address for both emails (defaults to SMTP_USER)
+ *   ADMIN_NOTIFY_EMAIL — where hot-lead alerts get sent (skipped if unset)
+ *   SCORE_MIN          — score threshold for human handoff (defaults to 55, matches call.html)
  */
 
 import express from 'express';
 import cors    from 'cors';
+import { getDb, leadsCollection } from './db.js';
+import { sendResumeEmail, sendHotLeadAlert } from './mailer.js';
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+const SCORE_MIN = Number(process.env.SCORE_MIN || 55);
+
+function newId(prefix) {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+}
 
 /* ── Middleware ── */
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type'] }));
+app.use(cors({
+  origin: process.env.FRONTEND_ORIGIN || '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'X-Admin-Key'],
+}));
 app.use(express.json());
 
 /* ── Health check (also wakes Render from sleep) ── */
@@ -100,6 +126,152 @@ app.post('/session', async (req, res) => {
   } catch (err) {
     console.error('Session proxy error:', err.message);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /lead
+ *
+ * Body: { name, email, phone, company, country, stage }
+ *
+ * Creates the lead record — this server is the source of truth for
+ * leadId/sessionId from here on, so the same IDs flow through the
+ * consent step, the call, and the transcript.
+ */
+app.post('/lead', async (req, res) => {
+  const { name, email, phone, company, country, stage } = req.body || {};
+  if (!name || !email) {
+    return res.status(400).json({ error: 'name and email are required' });
+  }
+
+  const lead = {
+    leadId:    newId('l'),
+    sessionId: newId('s'),
+    name, email, phone: phone || '', company: company || '',
+    country: country || '', stage: stage || '',
+    consent: 'pending',
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    transcript: [],
+    score: null,
+    humanHandoff: false,
+    hotAlertSent: false,
+  };
+
+  try {
+    const db = await getDb();
+    await leadsCollection(db).insertOne(lead);
+    return res.json({ leadId: lead.leadId, sessionId: lead.sessionId });
+  } catch (err) {
+    console.error('Lead create error:', err.message);
+    return res.status(500).json({ error: 'Could not save lead' });
+  }
+});
+
+/**
+ * POST /consent
+ *
+ * Body: { leadId, sessionId, consent: 'yes' | 'no' }
+ *
+ * Records the visitor's answer to "connect me with Dr. CV now?".
+ * On "no", emails them a resumable link to the call carrying their info.
+ */
+app.post('/consent', async (req, res) => {
+  const { leadId, sessionId, consent } = req.body || {};
+  if (!leadId || !sessionId || !['yes', 'no'].includes(consent)) {
+    return res.status(400).json({ error: 'leadId, sessionId and consent (yes|no) are required' });
+  }
+
+  try {
+    const db = await getDb();
+    const result = await leadsCollection(db).findOneAndUpdate(
+      { leadId, sessionId },
+      { $set: { consent, consentAt: new Date(), updatedAt: new Date() } },
+      { returnDocument: 'after' }
+    );
+    const lead = result.value || result; // driver version differences
+    if (!lead) return res.status(404).json({ error: 'Lead not found' });
+
+    if (consent === 'no') {
+      sendResumeEmail(lead).catch(err => console.error('Resume email failed:', err.message));
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Consent update error:', err.message);
+    return res.status(500).json({ error: 'Could not record consent' });
+  }
+});
+
+/**
+ * POST /transcript
+ *
+ * Called repeatedly during a call, and once more at the end.
+ *
+ * Mid-call body:  { leadId, sessionId, turn: { role, text, n, ts } }
+ * End-of-call:    { leadId, sessionId, complete: true, duration, turnCount, score }
+ *
+ * At completion, flags the lead for human handoff if score.total >= SCORE_MIN
+ * and sends one hot-lead alert email (guarded so it only fires once).
+ */
+app.post('/transcript', async (req, res) => {
+  const { leadId, sessionId, turn, complete, duration, turnCount, score } = req.body || {};
+  if (!leadId || !sessionId) {
+    return res.status(400).json({ error: 'leadId and sessionId are required' });
+  }
+
+  try {
+    const db = await getDb();
+    const col = leadsCollection(db);
+
+    if (turn) {
+      await col.updateOne(
+        { leadId, sessionId },
+        { $push: { transcript: turn }, $set: { updatedAt: new Date() } },
+        { upsert: true }
+      );
+      return res.json({ ok: true });
+    }
+
+    if (complete) {
+      const humanHandoff = !!(score && score.total >= SCORE_MIN);
+      const result = await col.findOneAndUpdate(
+        { leadId, sessionId },
+        { $set: { duration, turnCount, score, humanHandoff, updatedAt: new Date() } },
+        { returnDocument: 'after' }
+      );
+      const lead = result.value || result;
+
+      if (humanHandoff && lead && !lead.hotAlertSent) {
+        sendHotLeadAlert(lead).catch(err => console.error('Hot lead alert failed:', err.message));
+        await col.updateOne({ leadId, sessionId }, { $set: { hotAlertSent: true } });
+      }
+      return res.json({ ok: true, humanHandoff });
+    }
+
+    return res.status(400).json({ error: 'Provide either turn or complete' });
+  } catch (err) {
+    console.error('Transcript update error:', err.message);
+    return res.status(500).json({ error: 'Could not save transcript' });
+  }
+});
+
+/**
+ * GET /lead/:leadId — for internal/CRM use only, gated by ADMIN_API_KEY.
+ * Pass the key as header X-Admin-Key.
+ */
+app.get('/lead/:leadId', async (req, res) => {
+  const key = process.env.ADMIN_API_KEY;
+  if (key && req.headers['x-admin-key'] !== key) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const db = await getDb();
+    const lead = await leadsCollection(db).findOne({ leadId: req.params.leadId });
+    if (!lead) return res.status(404).json({ error: 'Not found' });
+    return res.json(lead);
+  } catch (err) {
+    console.error('Lead fetch error:', err.message);
+    return res.status(500).json({ error: 'Could not fetch lead' });
   }
 });
 
