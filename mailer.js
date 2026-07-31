@@ -63,20 +63,29 @@ export async function sendResumeEmail(lead) {
   });
 }
 
-export async function sendHotLeadAlert(lead) {
+export async function sendNewLeadAlert(lead) {
   const t = getTransporter();
   const to = process.env.ADMIN_NOTIFY_EMAIL;
   if (!t || !to) return;
 
-  const sc = lead.score || {};
+  const s = lead.summary || {};
+  const bullets = (arr) => (arr && arr.length)
+    ? `<ul>${arr.map(x => `<li>${x}</li>`).join('')}</ul>`
+    : '<p style="color:#888">None noted</p>';
+
   await t.sendMail({
     from: process.env.MAIL_FROM || process.env.SMTP_USER,
     to,
-    subject: `\u{1F525} Hot lead: ${lead.name || 'Unknown'} (${lead.company || 'no company'})`,
+    subject: `New Dr. CV conversation: ${lead.name || 'Unknown'} (${lead.company || 'no company'})`,
     html: `
       <p><strong>${lead.name || ''}</strong> \u00b7 ${lead.email || ''} \u00b7 ${lead.phone || ''}</p>
-      <p>Score: ${sc.total ?? 'n/a'} (${sc.level ?? 'n/a'})</p>
       <p>Country: ${lead.country || 'n/a'} \u2014 Stage: ${lead.stage || 'n/a'}</p>
+      <p>${s.summary || 'No summary generated.'}</p>
+      <p><strong>Key points</strong></p>${bullets(s.keyPoints)}
+      <p><strong>Concerns raised</strong></p>${bullets(s.concernsRaised)}
+      <p><strong>Services discussed</strong></p>${bullets(s.servicesDiscussed)}
+      <p><strong>Suggested next step:</strong> ${s.nextSteps || 'n/a'}</p>
+      <p><strong>Sentiment:</strong> ${s.sentiment || 'n/a'}</p>
       <p>Lead ID: ${lead.leadId}</p>
     `,
   });
