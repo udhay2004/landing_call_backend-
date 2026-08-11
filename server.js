@@ -14,7 +14,10 @@
  *                           concerns, services discussed, next steps) via
  *                           Claude so every completed call is CRM-ready —
  *                           no scoring/threshold, every lead shows up.
- *   5. GET  /             → health-check / keep-alive.
+ *   5. GET  /resume/:leadId → public lookup used by call.html to hydrate a
+ *                           resumed session from just a leadId, so the
+ *                           emailed link doesn't carry PII in the URL.
+ *   6. GET  /             → health-check / keep-alive.
  *
  * ENV VARS required:
  *   OPENAI_API_KEY    — your OpenAI secret key (NOT Anthropic), for the Realtime session
@@ -256,6 +259,34 @@ app.post('/transcript', async (req, res) => {
   } catch (err) {
     console.error('Transcript update error:', err.message);
     return res.status(500).json({ error: 'Could not save transcript' });
+  }
+});
+
+/**
+ * GET /resume/:leadId
+ *
+ * Public, unauthenticated — but only usable if you already possess the
+ * leadId, which is a long random token (see newId()) sent only to the
+ * lead's own inbox. This lets the emailed "resume" link carry just the
+ * leadId instead of the visitor's name/email/company etc. in the URL,
+ * so links look clean and don't leak PII via browser history, server
+ * logs, or email link-preview scanners.
+ *
+ * Returns only what call.html needs to resume the session — never the
+ * transcript or summary (those stay behind /lead/:leadId + admin key).
+ */
+app.get('/resume/:leadId', async (req, res) => {
+  try {
+    const db = await getDb();
+    const lead = await leadsCollection(db).findOne(
+      { leadId: req.params.leadId },
+      { projection: { name: 1, email: 1, company: 1, country: 1, stage: 1, sessionId: 1, _id: 0 } }
+    );
+    if (!lead) return res.status(404).json({ error: 'Not found' });
+    return res.json(lead);
+  } catch (err) {
+    console.error('Resume lookup error:', err.message);
+    return res.status(500).json({ error: 'Could not fetch lead' });
   }
 });
 
