@@ -197,7 +197,18 @@ app.post('/consent', async (req, res) => {
     if (!lead) return res.status(404).json({ error: 'Lead not found' });
 
     if (consent === 'no') {
-      sendResumeEmail(lead).catch(err => console.error('Resume email failed:', err.message));
+      // Awaited on purpose: on Vercel (serverless), the function instance
+      // can freeze right after the response is sent, killing any pending
+      // background work — which was cutting this email off mid-send or
+      // delaying it until the next request happened to wake the container
+      // back up. Awaiting it guarantees it actually completes first.
+      try {
+        await sendResumeEmail(lead);
+      } catch (err) {
+        console.error('Resume email failed:', err.message);
+        // Don't fail the whole request just because the email didn't send —
+        // the consent is still recorded either way.
+      }
     }
     return res.json({ ok: true });
   } catch (err) {
@@ -250,7 +261,13 @@ app.post('/transcript', async (req, res) => {
       const lead = result.value || result;
 
       if (lead) {
-        sendNewLeadAlert(lead).catch(err => console.error('New lead alert failed:', err.message));
+        // Same reasoning as /consent above: await it so it can't get cut
+        // off by Vercel freezing the function after the response is sent.
+        try {
+          await sendNewLeadAlert(lead);
+        } catch (err) {
+          console.error('New lead alert failed:', err.message);
+        }
       }
       return res.json({ ok: true });
     }
