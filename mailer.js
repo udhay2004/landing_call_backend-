@@ -24,17 +24,13 @@ function getTransporter() {
 }
 
 function buildResumeLink(lead) {
+  // Only the leadId goes in the link — call.html looks everything else
+  // (name, email, company, sessionId, etc.) up from the backend via
+  // GET /resume/:leadId. Keeps the emailed URL short and clean instead of
+  // a long string of personal data, which is what made it look spammy/
+  // phishy and got it flagged by mail clients and skeptical recipients.
   const base = (process.env.FRONTEND_URL || '').replace(/\/$/, '');
-  const params = new URLSearchParams({
-    name:      lead.name    || '',
-    email:     lead.email   || '',
-    company:   lead.company || '',
-    country:   lead.country || '',
-    stage:     lead.stage   || '',
-    leadId:    lead.leadId,
-    sessionId: lead.sessionId,
-  });
-  return `${base}/call.html?${params.toString()}`;
+  return `${base}/call.html?leadId=${encodeURIComponent(lead.leadId)}`;
 }
 
 export async function sendResumeEmail(lead) {
