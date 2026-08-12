@@ -38,7 +38,7 @@ import express from 'express';
 import cors    from 'cors';
 import crypto  from 'crypto';
 import { getDb, leadsCollection } from './db.js';
-import { sendResumeEmail, sendNewLeadAlert } from './mailer.js';
+import { sendResumeEmail } from './mailer.js';
 import { summarizeConversation } from './summarize.js';
 
 const app  = express();
@@ -257,22 +257,16 @@ app.post('/transcript', async (req, res) => {
       const existing = await col.findOne({ leadId, sessionId });
       const summary = await summarizeConversation(existing?.transcript || []);
 
-      const result = await col.findOneAndUpdate(
+      await col.findOneAndUpdate(
         { leadId, sessionId },
         { $set: { duration, turnCount, summary, completedAt: new Date(), updatedAt: new Date() } },
         { returnDocument: 'after' }
       );
-      const lead = result.value || result;
 
-      if (lead) {
-        // Same reasoning as /consent above: await it so it can't get cut
-        // off by Vercel freezing the function after the response is sent.
-        try {
-          await sendNewLeadAlert(lead);
-        } catch (err) {
-          console.error('New lead alert failed:', err.message);
-        }
-      }
+      // No email here on purpose — a completed call should just land in
+      // MongoDB for the CRM to pick up. The only email this backend ever
+      // sends is the /consent "no" resume link, when someone chooses to
+      // talk later instead of right now.
       return res.json({ ok: true });
     }
 
