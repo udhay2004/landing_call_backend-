@@ -36,6 +36,7 @@
 
 import express from 'express';
 import cors    from 'cors';
+import crypto  from 'crypto';
 import { getDb, leadsCollection } from './db.js';
 import { sendResumeEmail, sendNewLeadAlert } from './mailer.js';
 import { summarizeConversation } from './summarize.js';
@@ -43,8 +44,11 @@ import { summarizeConversation } from './summarize.js';
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
+// Short, URL-safe, still effectively collision-proof (36^8 ≈ 2.8 trillion
+// combinations) — a big improvement over the old `l_<timestamp>_<random>`
+// IDs, which made emailed links long enough to look spammy/phishy.
 function newId(prefix) {
-  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  return `${prefix}${crypto.randomBytes(5).toString('base64url').slice(0, 8)}`;
 }
 
 /* ── Middleware ── */
