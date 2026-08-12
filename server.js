@@ -325,6 +325,37 @@ app.get('/lead/:leadId', async (req, res) => {
   }
 });
 
+/**
+ * GET /leads — for internal/CRM use only, gated by ADMIN_API_KEY.
+ * Pass the key as header X-Admin-Key.
+ *
+ * Returns every lead (newest first) as a flat array — this is what the
+ * CRM's "Landing Voicebot" tab actually pulls from. It tries /summaries
+ * first, then /call-summaries, then /leads, so this same handler is also
+ * mounted at those two extra paths below for compatibility.
+ */
+async function listLeadsHandler(req, res) {
+  const key = process.env.ADMIN_API_KEY;
+  if (key && req.headers['x-admin-key'] !== key) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const db = await getDb();
+    const leads = await leadsCollection(db)
+      .find({}, { projection: { transcript: 0 } }) // transcript can be long; omit from the list view
+      .sort({ createdAt: -1 })
+      .limit(1000)
+      .toArray();
+    return res.json(leads);
+  } catch (err) {
+    console.error('Leads list error:', err.message);
+    return res.status(500).json({ error: 'Could not fetch leads' });
+  }
+}
+app.get('/leads', listLeadsHandler);
+app.get('/summaries', listLeadsHandler);
+app.get('/call-summaries', listLeadsHandler);
+
 app.listen(PORT, () => {
   console.log(`Comply Globally Dr.CV proxy → port ${PORT}`);
 });
